@@ -20,6 +20,7 @@
 #include "remote/jsonrpc.hpp"
 #include "base/netstring.hpp"
 #include "base/json.hpp"
+#include "base/console.hpp"
 
 using namespace icinga;
 
@@ -31,6 +32,7 @@ using namespace icinga;
 void JsonRpc::SendMessage(const Stream::Ptr& stream, const Dictionary::Ptr& message)
 {
 	String json = JsonEncode(message);
+	std::cerr << ConsoleColorTag(Console_ForegroundBlue) << ">> " << json << ConsoleColorTag(Console_Normal) << "\n";
 	NetString::WriteStringToStream(stream, json);
 }
 
@@ -43,6 +45,8 @@ StreamReadStatus JsonRpc::ReadMessage(const Stream::Ptr& stream, String *message
 		return srs;
 
 	*message = jsonString;
+
+	std::cerr << ConsoleColorTag(Console_ForegroundBlue) << "<< " << jsonString << ConsoleColorTag(Console_Normal) << "\n";
 
 	return StatusNewItem;
 }
