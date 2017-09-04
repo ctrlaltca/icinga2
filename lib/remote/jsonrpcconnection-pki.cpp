@@ -34,6 +34,8 @@ using namespace icinga;
 
 static Value RequestCertificateHandler(const MessageOrigin::Ptr& origin, const Dictionary::Ptr& params);
 REGISTER_APIFUNCTION(RequestCertificate, pki, &RequestCertificateHandler);
+static Value UpdateCertificateHandler(const MessageOrigin::Ptr& origin, const Dictionary::Ptr& params);
+REGISTER_APIFUNCTION(UpdateCertificate, pki, &UpdateCertificateHandler);
 
 Value RequestCertificateHandler(const MessageOrigin::Ptr& origin, const Dictionary::Ptr& params)
 {
@@ -64,6 +66,8 @@ Value RequestCertificateHandler(const MessageOrigin::Ptr& origin, const Dictiona
 	for (unsigned int i = 0; i < n; i++)
 		sprintf(certFingerprint + 2 * i, "%02x", digest[i]);
 
+	result->Set("fingerprint_request", certFingerprint);
+
 	String requestDir = Application::GetLocalStateDir() + "/lib/icinga2/pki-requests";
 	String requestPath = requestDir + "/" + certFingerprint + ".json";
 
@@ -81,6 +85,12 @@ Value RequestCertificateHandler(const MessageOrigin::Ptr& origin, const Dictiona
 			result->Set("cert", certResponse);
 			result->Set("status_code", 0);
 
+			Dictionary::Ptr message = new Dictionary();
+			message->Set("jsonrpc", "2.0");
+			message->Set("method", "pki::UpdateCertificate");
+			message->Set("params", result);
+			JsonRpc::SendMessage(origin->FromClient->GetStream(), message);
+
 			return result;
 		}
 	}
@@ -88,6 +98,7 @@ Value RequestCertificateHandler(const MessageOrigin::Ptr& origin, const Dictiona
 	boost::shared_ptr<X509> newcert;
 	EVP_PKEY *pubkey;
 	X509_NAME *subject;
+	Dictionary::Ptr message;
 
 	if (!Utility::PathExists(GetIcingaCADir() + "/ca.key"))
 		goto delayed_request;
@@ -140,6 +151,12 @@ Value RequestCertificateHandler(const MessageOrigin::Ptr& origin, const Dictiona
 
 	result->Set("status_code", 0);
 
+	message = new Dictionary();
+	message->Set("jsonrpc", "2.0");
+	message->Set("method", "pki::UpdateCertificate");
+	message->Set("params", result);
+	JsonRpc::SendMessage(origin->FromClient->GetStream(), message);
+
 	return result;
 
 delayed_request:
@@ -151,27 +168,29 @@ delayed_request:
 
 	Utility::SaveJsonFile(requestPath, 0600, request);
 
-	JsonRpcConnection::SyncCertificateRequest(JsonRpcConnection::Ptr(), origin, requestPath);
+	JsonRpcConnection::SendCertificateRequest(JsonRpcConnection::Ptr(), origin, requestPath);
 
 	result->Set("status_code", 2);
 	result->Set("error", "Certificate request is pending. Waiting for approval from the parent Icinga instance.");
 	return result;
 }
 
-void JsonRpcConnection::SendCertificateRequest(void)
+void JsonRpcConnection::SendCertificateRequest(const JsonRpcConnection::Ptr& aclient, const MessageOrigin::Ptr& origin, const String& path)
 {
 	Dictionary::Ptr message = new Dictionary();
 	message->Set("jsonrpc", "2.0");
 	message->Set("method", "pki::RequestCertificate");
 
-	String id = Utility::NewUniqueID();
-	message->Set("id", id);
-
-	Dictionary::Ptr params = new Dictionary();
-
 	ApiListener::Ptr listener = ApiListener::GetInstance();
 
-	if (listener) {
+	if (!listener)
+		return;
+
+	Dictionary::Ptr params = new Dictionary();
+	message->Set("params", params);
+
+	/* path is empty if this is our own request */
+	if (path.IsEmpty()) {
 		String ticketPath = Application::GetLocalStateDir() + "/lib/icinga2/pki/ticket";
 
 		std::ifstream fp(ticketPath.CStr());
@@ -179,40 +198,72 @@ void JsonRpcConnection::SendCertificateRequest(void)
 		fp.close();
 
 		params->Set("ticket", ticket);
+	} else {
+		Dictionary::Ptr request = Utility::LoadJsonFile(path);
+
+		if (request->Contains("cert_response"))
+			return;
+
+		params->Set("cert_request", request->Get("cert_request"));
+		params->Set("ticket", request->Get("ticket"));
 	}
 
-	message->Set("params", params);
-
-	RegisterCallback(id, boost::bind(&JsonRpcConnection::CertificateRequestResponseHandler, this, _1));
-
-	JsonRpc::SendMessage(GetStream(), message);
+	if (aclient)
+		JsonRpc::SendMessage(aclient->GetStream(), message);
+	else
+		listener->RelayMessage(origin, Zone::GetLocalZone(), message, false);
 }
 
-void JsonRpcConnection::CertificateRequestResponseHandler(const Dictionary::Ptr& message)
+Value UpdateCertificateHandler(const MessageOrigin::Ptr& origin, const Dictionary::Ptr& params)
 {
-	Log(LogWarning, "JsonRpcConnection")
-	    << message->ToString();
+	if (origin->FromZone && !Zone::GetLocalZone()->IsChildOf(origin->FromZone)) {
+		Log(LogWarning, "ClusterEvents")
+		    << "Discarding 'update certificate' message from '" << origin->FromClient->GetIdentity() << "': Invalid endpoint origin (client not allowed).";
 
-	Dictionary::Ptr result = message->Get("result");
-
-	if (!result)
-		return;
-
-	String ca = result->Get("ca");
-	String cert = result->Get("cert");
-	int status = result->Get("status_code");
-
-	/* TODO: make sure the cert's public key matches ours */
-
-	if (status != 0) {
-		/* TODO: log error */
-		return;
+		return Empty;
 	}
+
+	Log(LogWarning, "JsonRpcConnection")
+	    << params->ToString();
+
+	String ca = params->Get("ca");
+	String cert = params->Get("cert");
 
 	ApiListener::Ptr listener = ApiListener::GetInstance();
 
 	if (!listener)
-		return;
+		return Empty;
+
+	boost::shared_ptr<X509> oldCert = GetX509Certificate(listener->GetCertPath());
+	boost::shared_ptr<X509> newCert = StringToCertificate(cert);
+
+	Log(LogWarning, "JsonRpcConnection")
+	    << "Received certificate update message for CN '" << GetCertificateCN(newCert) << "'";
+
+	/* check if this is a certificate update for a subordinate instance */
+	if (X509_NAME_cmp(X509_get_subject_name(oldCert.get()), X509_get_subject_name(newCert.get())) != 0 ||
+	    EVP_PKEY_cmp(X509_get_pubkey(oldCert.get()), X509_get_pubkey(newCert.get())) != 1) {
+
+		String certFingerprint = params->Get("fingerprint_request");
+
+		/* TODO: validate fingerprint path name: ^[0-9a-f]+$ */
+
+		String requestDir = Application::GetLocalStateDir() + "/lib/icinga2/pki-requests";
+		String requestPath = requestDir + "/" + certFingerprint + ".json";
+
+		std::cout << requestPath << "\n";
+
+		if (Utility::PathExists(requestPath)) {
+			Log(LogWarning, "JsonRpcConnection")
+			    << "Saved certificate update for CN '" << GetCertificateCN(newCert) << "'";
+
+			Dictionary::Ptr request = Utility::LoadJsonFile(requestPath);
+			request->Set("cert_response", cert);
+			Utility::SaveJsonFile(requestPath, 0644, request);
+		}
+
+		return Empty;
+	}
 
 	String caPath = listener->GetCaPath();
 
@@ -261,33 +312,6 @@ void JsonRpcConnection::CertificateRequestResponseHandler(const Dictionary::Ptr&
 
 	Log(LogInformation, "JsonRpcConnection", "Updating the client certificate for the ApiListener object");
 	listener->UpdateSSLContext();
-}
 
-void JsonRpcConnection::SyncCertificateRequest(const JsonRpcConnection::Ptr& aclient, const MessageOrigin::Ptr& origin, const String& path)
-{
-	Dictionary::Ptr request = Utility::LoadJsonFile(path);
-
-	if (request->Contains("cert_response"))
-		return;
-
-	Dictionary::Ptr message = new Dictionary();
-	message->Set("jsonrpc", "2.0");
-	message->Set("method", "pki::RequestCertificate");
-
-	Dictionary::Ptr params = new Dictionary();
-	params->Set("cert_request", request->Get("cert_request"));
-	params->Set("ticket", request->Get("ticket"));
-
-	message->Set("params", params);
-
-	if (aclient)
-		JsonRpc::SendMessage(aclient->GetStream(), message);
-	else {
-		ApiListener::Ptr listener = ApiListener::GetInstance();
-
-		if (!listener)
-			return;
-
-		listener->RelayMessage(origin, Zone::GetLocalZone(), message, false);
-	}
+	return Empty;
 }
